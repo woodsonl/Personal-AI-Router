@@ -392,7 +392,7 @@ func NewBroker(codec *Codec, paths workerPaths) *Broker {
 	// only. The same value is passed to nvpair-errors via --node-id so
 	// its localNodeID stays in lockstep with what the broker stamps.
 	nodeID := resolveLocalNodeID(paths.clusterDir)
-	return &Broker{
+	b := &Broker{
 		codec:              codec,
 		startedAt:          time.Now(),
 		nodeID:             nodeID,
@@ -418,6 +418,7 @@ func NewBroker(codec *Codec, paths workerPaths) *Broker {
 		ollamaPortReady:    make(chan struct{}),
 		lmstudioPortReady:  make(chan struct{}),
 	}
+	return b
 }
 
 // registerService records a local service in the discovery registration cache
@@ -2039,6 +2040,18 @@ func (b *Broker) runWorkloadHistoryFlusher(ctx context.Context) func() {
 	}
 }
 
+// errTerminalRead reports that the client stdin read loop ended on a
+// non-recoverable scanner/transport error (e.g. an over-long frame that
+// bufio.Scanner cannot resync past), distinct from a clean EOF.
+var errTerminalRead = stderrors.New("terminal read error")
+
+// messageDispatchConcurrency is the size of the broker's inbound dispatch
+// pool: enough worker goroutines that one slow synchronous worker relay
+// (bounded by rpcWorkerCallTimeout) cannot head-of-line block the rest of
+// the control plane, few enough that handlers stay effectively serialized
+// under normal traffic.
+const messageDispatchConcurrency = 4
+
 func (b *Broker) Serve(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	b.cancel = cancel
@@ -2604,12 +2617,46 @@ func (b *Broker) readLoop(ctx context.Context) error {
 			case <-ctx.Done():
 				return
 			}
-			// EOF is terminal (stream closed); other errors are per-line
-			// (e.g. a bad JSON frame) and the next Read advances past them.
-			if err == io.EOF {
-				return
+			// A decoded message (err nil) and a recoverable decode error
+			// (bad frame; the next Read advances past it) both keep the pump
+			// running. EOF is terminal (stream closed), and any other error
+			// is a terminal scanner/transport error: stop feeding the
+			// channel so the consumer exits instead of spinning.
+			if err == nil {
+				continue
 			}
+			var de *DecodeError
+			if stderrors.As(err, &de) {
+				continue
+			}
+			return
 		}
+	}()
+
+	// Bounded dispatch pool: handleMessage runs synchronous worker relays
+	// (proxy/cluster/settings/manual-nodes, each bounded by
+	// rpcWorkerCallTimeout) so dispatching on the read loop would let one
+	// slow worker stall every other client request for up to 5s. A small
+	// worker pool decouples them. Cross-request ordering is preserved for
+	// the channels that need it by dedicated mutexes inside the handlers
+	// (workloadEmitMu serializes workload apply→fan→emit; subscription
+	// bookkeeping is per-state mutexed), and JSON-RPC has no cross-request
+	// response-ordering guarantee — each response carries its own id. The
+	// codec's write mutex keeps concurrent responses from interleaving.
+	dispatch := make(chan *Message)
+	var dispatchWG sync.WaitGroup
+	for range messageDispatchConcurrency {
+		dispatchWG.Add(1)
+		go func() {
+			defer dispatchWG.Done()
+			for msg := range dispatch {
+				b.handleMessage(msg)
+			}
+		}()
+	}
+	defer func() {
+		close(dispatch)
+		dispatchWG.Wait()
 	}()
 
 	for {
@@ -2621,10 +2668,16 @@ func (b *Broker) readLoop(ctx context.Context) error {
 				if r.err == io.EOF || ctx.Err() != nil {
 					return nil
 				}
-				slog.Warn("JSON-RPC read error", "err", r.err)
-				continue
+				// Terminal scanner/transport error — the producer goroutine
+				// has already stopped; exit instead of spinning.
+				slog.Warn("JSON-RPC read error (terminal)", "err", r.err)
+				return errTerminalRead
 			}
-			b.handleMessage(r.msg)
+			select {
+			case dispatch <- r.msg:
+			case <-ctx.Done():
+				return nil
+			}
 			if ctx.Err() != nil {
 				return nil
 			}
