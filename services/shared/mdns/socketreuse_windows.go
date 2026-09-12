@@ -14,6 +14,11 @@ import "syscall"
 // openSendConn.
 const sendSourcePort = 0
 
+// sendFromRecvSocket is false on Windows: the platform refuses to send from
+// the socket bound to the multicast group, so Run never shares its receive
+// socket and sends always go through a fresh per-send socket.
+const sendFromRecvSocket = false
+
 // setReuseAddr is the Windows counterpart of the Unix build. The only
 // difference is the socket handle type (syscall.Handle vs int). See the Unix
 // file for the rationale; SO_REUSEADDR on Windows gives the shared-bind

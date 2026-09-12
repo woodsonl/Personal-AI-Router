@@ -16,9 +16,11 @@
 // invisible to LAN peers.
 //
 // We keep zeroconf's receive trick (join the group on each multicast interface,
-// which works fine on Windows) but send every reply/announcement from a
-// per-interface unicast-bound socket with SetMulticastInterface set explicitly.
-// That path is well-supported on Windows.
+// which works fine on Windows). On Unix, replies and announcements go out that
+// same receive socket, so they originate from 5353 as RFC 6762 §6 requires. On
+// Windows, which refuses to send from a group-bound socket, they instead go out
+// a per-interface unicast-bound socket with SetMulticastInterface set
+// explicitly; that path is well-supported there.
 //
 // This is the single implementation consolidated (the mDNS dedup) from the five
 // near-identical copies that lived in nvpair-advertiser,
@@ -97,6 +99,14 @@ type Responder struct {
 	addrMu sync.RWMutex
 	// ifaceAddrs maps interface index to its IPv4 unicast addresses.
 	ifaceAddrs map[int][]net.IP
+
+	// sendMu guards sendPC. Run sets it on platforms that transmit from the
+	// receive socket (see sendFromRecvSocket); while non-nil, sends go out
+	// that socket so they share its source port and never briefly bind a
+	// second socket to 5353, which would capture unicast queries meant for
+	// the receive socket. Nil on Windows and before Run binds.
+	sendMu sync.Mutex
+	sendPC *ipv4.PacketConn
 }
 
 // NewResponder builds a Responder for the given service instance. domain
@@ -155,6 +165,22 @@ func (r *Responder) ifaces() map[int][]net.IP {
 	r.addrMu.RLock()
 	defer r.addrMu.RUnlock()
 	return r.ifaceAddrs
+}
+
+// setSendPC installs (or clears) the socket sends use instead of a fresh
+// per-send socket. Called by Run on platforms where sendFromRecvSocket is set.
+func (r *Responder) setSendPC(pc *ipv4.PacketConn) {
+	r.sendMu.Lock()
+	r.sendPC = pc
+	r.sendMu.Unlock()
+}
+
+// sharedSendPC returns the shared send socket, or nil when sends should open a
+// fresh per-send socket (Windows, or before Run binds).
+func (r *Responder) sharedSendPC() *ipv4.PacketConn {
+	r.sendMu.Lock()
+	defer r.sendMu.Unlock()
+	return r.sendPC
 }
 
 // UpdateTXT swaps the advertised TXT records and re-announces immediately. It
@@ -257,6 +283,14 @@ func (r *Responder) Run(ctx context.Context) error {
 	// but functionally correct. So we treat any error from this as advisory.
 	if err := pc.SetControlMessage(ipv4.FlagInterface, true); err != nil {
 		slog.Debug("mdns: control message not available, will reply on all interfaces", "reason", err)
+	}
+
+	// Transmit from this same socket on platforms where that is allowed, so
+	// responses leave from 5353 (RFC 6762 §6) without a second socket on 5353
+	// that would capture unicast traffic meant for this one.
+	if sendFromRecvSocket {
+		r.setSendPC(pc)
+		defer r.setSendPC(nil)
 	}
 
 	var joined int
@@ -570,11 +604,11 @@ func (r *Responder) sendUnicast(buf []byte, ifIndex int, to net.Addr) {
 	}
 }
 
-// openSendConn opens the per-interface socket sendOnInterface transmits from.
-// On Unix it binds the local mDNS port (see sendSourcePort) so our datagrams
-// originate from 5353 as RFC 6762 §6 requires; on Windows it binds ephemeral,
-// where a second socket on 5353 is unreliable. setReuseAddr lets the socket
-// share 5353 with Run's receive socket and any other local mDNS responder.
+// openSendConn opens a fresh per-interface socket for send paths that cannot
+// use the receive socket: Windows, and sends before Run binds. On Unix it
+// binds the local mDNS port (see sendSourcePort) so datagrams still originate
+// from 5353; on Windows it binds ephemeral, where a second socket on 5353 is
+// unreliable. setReuseAddr lets it share 5353 with any local mDNS responder.
 func openSendConn(src net.IP) (*net.UDPConn, error) {
 	lc := net.ListenConfig{Control: setReuseAddr}
 	pktConn, err := lc.ListenPacket(context.Background(), "udp4", net.JoinHostPort(src.String(), fmt.Sprint(sendSourcePort)))
@@ -584,11 +618,31 @@ func openSendConn(src net.IP) (*net.UDPConn, error) {
 	return pktConn.(*net.UDPConn), nil
 }
 
-// sendOnInterface is the core of the Windows send workaround: it transmits buf
-// from a fresh unicast-bound socket on the given interface (setting the
-// multicast interface + TTL for group targets), never from the multicast-bound
-// receive socket that Windows refuses to send from.
+// sendOnInterface transmits buf to target on the given interface. It prefers
+// the shared receive socket, so datagrams originate from 5353 (RFC 6762 §6)
+// and no second socket briefly binds 5353 and captures unicast traffic meant
+// for the receive socket. Where the platform forbids sending from the receive
+// socket (Windows), it falls back to a fresh per-send socket.
 func (r *Responder) sendOnInterface(buf []byte, ifIndex int, target *net.UDPAddr) error {
+	if pc := r.sharedSendPC(); pc != nil {
+		cm := &ipv4.ControlMessage{IfIndex: ifIndex}
+		if target.IP.IsMulticast() {
+			cm.TTL = 255
+		}
+		if _, err := pc.WriteTo(buf, cm, target); err != nil {
+			slog.Debug("mdns: write failed", "iface", ifIndex, "target", target.String(), "err", err)
+			return err
+		}
+		return nil
+	}
+	return r.sendOnFreshConn(buf, ifIndex, target)
+}
+
+// sendOnFreshConn is the Windows path: it transmits buf from a fresh
+// unicast-bound socket on the given interface (setting the multicast
+// interface + TTL for group targets), never from the multicast-bound receive
+// socket that Windows refuses to send from.
+func (r *Responder) sendOnFreshConn(buf []byte, ifIndex int, target *net.UDPAddr) error {
 	addrs, ok := r.ifaces()[ifIndex]
 	if !ok || len(addrs) == 0 {
 		return errors.New("no addresses on interface")
