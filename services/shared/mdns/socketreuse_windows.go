@@ -7,13 +7,6 @@ package mdns
 
 import "syscall"
 
-// sendSourcePort is the local UDP port outbound datagrams are sent from.
-// Windows keeps the original ephemeral-port behavior: it will not reliably
-// send from a socket bound to the contested mDNS port, and a Windows host is
-// normally discovered directly rather than through a reflector. See
-// openSendConn.
-const sendSourcePort = 0
-
 // sendFromRecvSocket is false on Windows: the platform refuses to send from
 // the socket bound to the multicast group, so Run never shares its receive
 // socket and sends always go through a fresh per-send socket.

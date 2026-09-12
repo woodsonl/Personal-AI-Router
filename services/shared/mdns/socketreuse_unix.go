@@ -7,11 +7,6 @@ package mdns
 
 import "syscall"
 
-// sendSourcePort is the local UDP port outbound datagrams are sent from when
-// the responder falls back to a fresh per-send socket (before Run binds the
-// receive socket). See openSendConn.
-const sendSourcePort = mdnsPort
-
 // sendFromRecvSocket makes Run transmit from its own receive socket. That
 // socket is already bound to 5353, so sends originate from the well-known
 // port without opening a second socket on 5353 — which would capture unicast

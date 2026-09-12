@@ -189,12 +189,10 @@ func TestAppendBrowseRRs(t *testing.T) {
 	}
 }
 
-// TestOpenSendConnBindsMDNSPort pins RFC 6762 §6: on platforms that advertise
-// from a well-known port, the send socket's local port is 5353, not ephemeral.
-func TestOpenSendConnBindsMDNSPort(t *testing.T) {
-	if sendSourcePort == 0 {
-		t.Skip("ephemeral send port on this platform")
-	}
+// TestOpenSendConnUsesEphemeralPort guards the unicast-steal fix: the fallback
+// send socket must not bind 5353, because a unicast-bound 5353 socket is more
+// specific than Run's receive socket and would capture its unicast traffic.
+func TestOpenSendConnUsesEphemeralPort(t *testing.T) {
 	conn, err := openSendConn(net.IPv4(127, 0, 0, 1))
 	if err != nil {
 		t.Fatalf("openSendConn: %v", err)
@@ -204,18 +202,15 @@ func TestOpenSendConnBindsMDNSPort(t *testing.T) {
 	if !ok {
 		t.Fatalf("LocalAddr = %T, want *net.UDPAddr", conn.LocalAddr())
 	}
-	if addr.Port != mdnsPort {
-		t.Fatalf("send socket local port = %d, want %d", addr.Port, mdnsPort)
+	if addr.Port == mdnsPort {
+		t.Fatalf("fallback send socket bound %d; it would capture unicast", mdnsPort)
 	}
 }
 
 // TestOpenSendConnCoexistsWithGroupSocket guards the bind path Run relies on:
-// the 5353 send socket must open while the multicast-group receive socket is
-// already bound to 5353 in the same process.
+// the fallback send socket must open while the multicast-group receive socket
+// is already bound to 5353 in the same process.
 func TestOpenSendConnCoexistsWithGroupSocket(t *testing.T) {
-	if sendSourcePort == 0 {
-		t.Skip("ephemeral send port on this platform")
-	}
 	lc := net.ListenConfig{Control: setReuseAddr}
 	group, err := lc.ListenPacket(context.Background(), "udp4", net.JoinHostPort(mdnsGroupV4.String(), fmt.Sprint(mdnsPort)))
 	if err != nil {
@@ -228,6 +223,16 @@ func TestOpenSendConnCoexistsWithGroupSocket(t *testing.T) {
 		t.Fatalf("openSendConn alongside group socket: %v", err)
 	}
 	defer conn.Close()
+}
+
+// TestSendOnInterfaceFreshConnGuard covers the fallback path when no shared
+// socket is installed: an interface with no addresses must error rather than
+// panic.
+func TestSendOnInterfaceFreshConnGuard(t *testing.T) {
+	r := &Responder{ifaceAddrs: map[int][]net.IP{}}
+	if err := r.sendOnInterface([]byte("x"), 42, mdnsTargetV4); err == nil {
+		t.Fatal("sendOnInterface with no addresses on the interface = nil error, want error")
+	}
 }
 
 // TestSendOnInterfaceUsesSharedSocket verifies the Unix send path: once Run

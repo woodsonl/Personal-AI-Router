@@ -51,6 +51,8 @@ import (
 
 const (
 	mdnsPort = 5353
+	// mdnsTTL is the multicast TTL RFC 6762 §11 requires for mDNS datagrams.
+	mdnsTTL = 255
 	// recordTTL matches what zeroconf advertises for non-A records (3200s)
 	// for service-level records, but RFC 6762 §10 says A records SHOULD use
 	// a TTL of 120s to account for IP address changes. We use the shorter
@@ -184,9 +186,9 @@ func (r *Responder) sharedSendPC() *ipv4.PacketConn {
 }
 
 // UpdateTXT swaps the advertised TXT records and re-announces immediately. It
-// is safe to call before or during Run (announcements are sent on freshly
-// opened per-interface sockets, independent of Run's receive socket). Callers
-// with a static TXT never need it.
+// is safe to call before or during Run. After Run installs the shared socket
+// the announcement is sent from it; before that it falls back to a fresh
+// per-interface socket. Callers with a static TXT never need it.
 func (r *Responder) UpdateTXT(txt []string) {
 	r.txtMu.Lock()
 	r.txt = append([]string(nil), txt...)
@@ -287,8 +289,13 @@ func (r *Responder) Run(ctx context.Context) error {
 
 	// Transmit from this same socket on platforms where that is allowed, so
 	// responses leave from 5353 (RFC 6762 §6) without a second socket on 5353
-	// that would capture unicast traffic meant for this one.
+	// that would capture unicast traffic meant for this one. RFC 6762 §11
+	// requires multicast mDNS to carry TTL 255; a ControlMessage.TTL is
+	// receive-only in x/net/ipv4, so set it as a socket option.
 	if sendFromRecvSocket {
+		if err := pc.SetMulticastTTL(mdnsTTL); err != nil {
+			slog.Debug("mdns: set multicast TTL failed", "err", err)
+		}
 		r.setSendPC(pc)
 		defer r.setSendPC(nil)
 	}
@@ -318,11 +325,10 @@ func (r *Responder) Run(ctx context.Context) error {
 
 	go r.watchAddrs(ctx)
 
-	go func() {
-		<-ctx.Done()
-		_ = udpConn.Close()
-	}()
-
+	// No ctx.Done closer here: the read loop's 500ms deadline plus the ctx.Err
+	// check at its top end the loop promptly, and the deferred udpConn.Close()
+	// must not run until after sendGoodbye() below has transmitted from this
+	// same socket.
 	buf := make([]byte, 65536)
 	for {
 		if ctx.Err() != nil {
@@ -604,14 +610,15 @@ func (r *Responder) sendUnicast(buf []byte, ifIndex int, to net.Addr) {
 	}
 }
 
-// openSendConn opens a fresh per-interface socket for send paths that cannot
-// use the receive socket: Windows, and sends before Run binds. On Unix it
-// binds the local mDNS port (see sendSourcePort) so datagrams still originate
-// from 5353; on Windows it binds ephemeral, where a second socket on 5353 is
-// unreliable. setReuseAddr lets it share 5353 with any local mDNS responder.
+// openSendConn opens a fresh per-interface socket for the send paths that
+// cannot use the receive socket: Windows, and sends before Run binds it. It
+// binds an ephemeral port, never 5353, because a socket bound to a unicast
+// address on 5353 is more specific than the receive socket and would capture
+// unicast traffic meant for it. setReuseAddr lets it coexist with any local
+// mDNS responder sharing the port.
 func openSendConn(src net.IP) (*net.UDPConn, error) {
 	lc := net.ListenConfig{Control: setReuseAddr}
-	pktConn, err := lc.ListenPacket(context.Background(), "udp4", net.JoinHostPort(src.String(), fmt.Sprint(sendSourcePort)))
+	pktConn, err := lc.ListenPacket(context.Background(), "udp4", net.JoinHostPort(src.String(), "0"))
 	if err != nil {
 		return nil, err
 	}
@@ -625,10 +632,10 @@ func openSendConn(src net.IP) (*net.UDPConn, error) {
 // socket (Windows), it falls back to a fresh per-send socket.
 func (r *Responder) sendOnInterface(buf []byte, ifIndex int, target *net.UDPAddr) error {
 	if pc := r.sharedSendPC(); pc != nil {
+		// IfIndex selects the egress interface per datagram. TTL is not
+		// settable here (ControlMessage.TTL is receive-only); Run sets the
+		// multicast TTL on this socket once instead.
 		cm := &ipv4.ControlMessage{IfIndex: ifIndex}
-		if target.IP.IsMulticast() {
-			cm.TTL = 255
-		}
 		if _, err := pc.WriteTo(buf, cm, target); err != nil {
 			slog.Debug("mdns: write failed", "iface", ifIndex, "target", target.String(), "err", err)
 			return err
@@ -638,10 +645,10 @@ func (r *Responder) sendOnInterface(buf []byte, ifIndex int, target *net.UDPAddr
 	return r.sendOnFreshConn(buf, ifIndex, target)
 }
 
-// sendOnFreshConn is the Windows path: it transmits buf from a fresh
-// unicast-bound socket on the given interface (setting the multicast
-// interface + TTL for group targets), never from the multicast-bound receive
-// socket that Windows refuses to send from.
+// sendOnFreshConn is the fallback used on Windows (which refuses to send from
+// the multicast-bound receive socket) and for sends before Run installs the
+// shared socket. It transmits buf from a fresh unicast-bound socket on the
+// given interface, setting the multicast interface and TTL for group targets.
 func (r *Responder) sendOnFreshConn(buf []byte, ifIndex int, target *net.UDPAddr) error {
 	addrs, ok := r.ifaces()[ifIndex]
 	if !ok || len(addrs) == 0 {
@@ -661,7 +668,7 @@ func (r *Responder) sendOnFreshConn(buf []byte, ifIndex int, target *net.UDPAddr
 	if target.IP.IsMulticast() {
 		pc := ipv4.NewPacketConn(conn)
 		_ = pc.SetMulticastInterface(ifi)
-		_ = pc.SetMulticastTTL(255)
+		_ = pc.SetMulticastTTL(mdnsTTL)
 	}
 	if _, err := conn.WriteToUDP(buf, target); err != nil {
 		slog.Debug("mdns: write failed", "iface", ifi.Name, "ip", src.String(), "target", target.String(), "err", err)
