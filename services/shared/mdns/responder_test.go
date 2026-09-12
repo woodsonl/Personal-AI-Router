@@ -4,6 +4,8 @@
 package mdns
 
 import (
+	"context"
+	"fmt"
 	"net"
 	"testing"
 
@@ -183,6 +185,47 @@ func TestAppendBrowseRRs(t *testing.T) {
 	if aCount != 1 {
 		t.Errorf("browse Extra A count = %d, want 1 (iface-scoped)", aCount)
 	}
+}
+
+// TestOpenSendConnBindsMDNSPort pins RFC 6762 §6: on platforms that advertise
+// from a well-known port, the send socket's local port is 5353, not ephemeral.
+func TestOpenSendConnBindsMDNSPort(t *testing.T) {
+	if sendSourcePort == 0 {
+		t.Skip("ephemeral send port on this platform")
+	}
+	conn, err := openSendConn(net.IPv4(127, 0, 0, 1))
+	if err != nil {
+		t.Fatalf("openSendConn: %v", err)
+	}
+	defer conn.Close()
+	addr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("LocalAddr = %T, want *net.UDPAddr", conn.LocalAddr())
+	}
+	if addr.Port != mdnsPort {
+		t.Fatalf("send socket local port = %d, want %d", addr.Port, mdnsPort)
+	}
+}
+
+// TestOpenSendConnCoexistsWithGroupSocket guards the bind path Run relies on:
+// the 5353 send socket must open while the multicast-group receive socket is
+// already bound to 5353 in the same process.
+func TestOpenSendConnCoexistsWithGroupSocket(t *testing.T) {
+	if sendSourcePort == 0 {
+		t.Skip("ephemeral send port on this platform")
+	}
+	lc := net.ListenConfig{Control: setReuseAddr}
+	group, err := lc.ListenPacket(context.Background(), "udp4", net.JoinHostPort(mdnsGroupV4.String(), fmt.Sprint(mdnsPort)))
+	if err != nil {
+		t.Skipf("cannot bind group receive socket: %v", err)
+	}
+	defer group.Close()
+
+	conn, err := openSendConn(net.IPv4(127, 0, 0, 1))
+	if err != nil {
+		t.Fatalf("openSendConn alongside group socket: %v", err)
+	}
+	defer conn.Close()
 }
 
 func TestIfaceAddrsEqual(t *testing.T) {

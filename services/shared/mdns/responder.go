@@ -570,6 +570,20 @@ func (r *Responder) sendUnicast(buf []byte, ifIndex int, to net.Addr) {
 	}
 }
 
+// openSendConn opens the per-interface socket sendOnInterface transmits from.
+// On Unix it binds the local mDNS port (see sendSourcePort) so our datagrams
+// originate from 5353 as RFC 6762 §6 requires; on Windows it binds ephemeral,
+// where a second socket on 5353 is unreliable. setReuseAddr lets the socket
+// share 5353 with Run's receive socket and any other local mDNS responder.
+func openSendConn(src net.IP) (*net.UDPConn, error) {
+	lc := net.ListenConfig{Control: setReuseAddr}
+	pktConn, err := lc.ListenPacket(context.Background(), "udp4", net.JoinHostPort(src.String(), fmt.Sprint(sendSourcePort)))
+	if err != nil {
+		return nil, err
+	}
+	return pktConn.(*net.UDPConn), nil
+}
+
 // sendOnInterface is the core of the Windows send workaround: it transmits buf
 // from a fresh unicast-bound socket on the given interface (setting the
 // multicast interface + TTL for group targets), never from the multicast-bound
@@ -584,7 +598,7 @@ func (r *Responder) sendOnInterface(buf []byte, ifIndex int, target *net.UDPAddr
 	if err != nil {
 		return err
 	}
-	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: src, Port: 0})
+	conn, err := openSendConn(src)
 	if err != nil {
 		slog.Debug("mdns: bind failed", "iface", ifi.Name, "ip", src.String(), "err", err)
 		return err

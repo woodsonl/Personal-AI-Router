@@ -7,6 +7,13 @@ package mdns
 
 import "syscall"
 
+// sendSourcePort is the local UDP port outbound datagrams are sent from.
+// Windows keeps the original ephemeral-port behavior: it will not reliably
+// send from a socket bound to the contested mDNS port, and a Windows host is
+// normally discovered directly rather than through a reflector. See
+// openSendConn.
+const sendSourcePort = 0
+
 // setReuseAddr is the Windows counterpart of the Unix build. The only
 // difference is the socket handle type (syscall.Handle vs int). See the Unix
 // file for the rationale; SO_REUSEADDR on Windows gives the shared-bind

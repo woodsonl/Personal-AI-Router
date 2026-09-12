@@ -7,6 +7,12 @@ package mdns
 
 import "syscall"
 
+// sendSourcePort is the local UDP port outbound datagrams are sent from.
+// RFC 6762 §6 requires responses to originate from the well-known mDNS port,
+// and a router-level mDNS reflector only classifies and relays a datagram as
+// mDNS when it arrives from 5353. See openSendConn.
+const sendSourcePort = mdnsPort
+
 // setReuseAddr is a net.ListenConfig.Control hook that sets SO_REUSEADDR on
 // the socket before bind. mDNS requires multiple processes on one host to
 // share UDP 5353; SO_REUSEADDR (the same option Go's ListenMulticastUDP and
